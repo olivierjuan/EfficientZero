@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import core.ctree.cytree as tree
 
-from torch.cuda.amp import autocast as autocast
+from torch.amp import autocast as autocast
 
 
 class MCTS(object):
@@ -70,7 +70,7 @@ class MCTS(object):
 
                 # evaluation for leaf nodes
                 if self.config.amp_type == 'torch_amp':
-                    with autocast():
+                    with autocast(device_type=device):
                         network_output = model.recurrent_inference(hidden_states, (hidden_states_c_reward, hidden_states_h_reward), last_actions)
                 else:
                     network_output = model.recurrent_inference(hidden_states, (hidden_states_c_reward, hidden_states_h_reward), last_actions)

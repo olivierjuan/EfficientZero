@@ -5,10 +5,14 @@ import torch
 import numpy as np
 import core.ctree.cytree as cytree
 
-from torch.cuda.amp import autocast as autocast
+from torch.amp import autocast as autocast
 from core.mcts import MCTS
 from core.model import concat_output, concat_output_value
 from core.utils import prepare_observation_lst, LinearSchedule
+import logging
+
+logger_cpu = logging.getLogger(__name__+'cpu')
+logger_gpu = logging.getLogger(__name__+'gpu')
 
 
 @ray.remote
@@ -69,7 +73,7 @@ class BatchWorker_CPU(object):
             # off-policy correction: shorter horizon of td steps
             delta_td = (total_transitions - idx) // config.auto_td_steps
             td_steps = config.td_steps - delta_td
-            td_steps = np.clip(td_steps, 1, 5).astype(np.int)
+            td_steps = np.clip(td_steps, 1, 5).astype(int)
 
             # prepare the corresponding observations for bootstrapped values o_{t+k}
             game_obs = game.obs(state_index + td_steps, config.num_unroll_steps)
@@ -225,24 +229,30 @@ class BatchWorker_CPU(object):
             policy_non_re_context = None
 
         countext = reward_value_context, policy_re_context, policy_non_re_context, inputs_batch, weights
+        logger_cpu.info('sending to mcts_storage...')
         self.mcts_storage.push(countext)
 
     def run(self):
         # start making mcts contexts to feed the GPU batch maker
         start = False
+        logger_cpu.addHandler(logging.FileHandler('cpu_worker.log'))
         while True:
             # wait for starting
             if not start:
                 start = ray.get(self.storage.get_start_signal.remote())
+                logger_cpu.info('waiting for start signal...')
                 time.sleep(1)
                 continue
+            logger_cpu.info('Start making mcts data...')
 
             ray_data_lst = [self.storage.get_counter.remote(), self.storage.get_target_weights.remote()]
             trained_steps, target_weights = ray.get(ray_data_lst)
 
             beta = self.beta_schedule.value(trained_steps)
             # obtain the batch context from replay buffer
+            logger_cpu.info('getting from replay_buffer...')
             batch_context = ray.get(self.replay_buffer.prepare_batch_context.remote(self.config.batch_size, beta))
+            logger_cpu.info('got data from replay_buffer...')
             # break
             if trained_steps >= self.config.training_steps + self.config.last_steps:
                 time.sleep(30)
@@ -258,12 +268,15 @@ class BatchWorker_CPU(object):
                 # Observation will be deleted if replay buffer is full. (They are stored in the ray object store)
                 try:
                     self.make_batch(batch_context, self.config.revisit_policy_search_rate, weights=target_weights)
-                except:
+                except Exception as e:
+                    logger_cpu.info(f'mcts data data for some exception {e}...')
                     print('Data is deleted...')
                     time.sleep(0.1)
+            else:
+                logger_cpu.info('mcts_storage full...')
 
 
-@ray.remote(num_gpus=0.125)
+@ray.remote(num_gpus=0.0)
 class BatchWorker_GPU(object):
     def __init__(self, worker_id, replay_buffer, storage, batch_storage, mcts_storage, config):
         """GPU Batch Worker for reanalyzing targets, see Appendix.
@@ -308,14 +321,14 @@ class BatchWorker_GPU(object):
             value_obs_lst = prepare_observation_lst(value_obs_lst)
             # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
             m_batch = self.config.mini_infer_size
-            slices = np.ceil(batch_size / m_batch).astype(np.int_)
+            slices = np.ceil(batch_size / m_batch).astype(int)
             network_output = []
             for i in range(slices):
                 beg_index = m_batch * i
                 end_index = m_batch * (i + 1)
                 m_obs = torch.from_numpy(value_obs_lst[beg_index:end_index]).to(device).float() / 255.0
                 if self.config.amp_type == 'torch_amp':
-                    with autocast():
+                    with autocast(device_type=self.config.device):
                         m_output = self.model.initial_inference(m_obs)
                 else:
                     m_output = self.model.initial_inference(m_obs)
@@ -399,7 +412,7 @@ class BatchWorker_GPU(object):
             policy_obs_lst = prepare_observation_lst(policy_obs_lst)
             # split a full batch into slices of mini_infer_size: to save the GPU memory for more GPU actors
             m_batch = self.config.mini_infer_size
-            slices = np.ceil(batch_size / m_batch).astype(np.int_)
+            slices = np.ceil(batch_size / m_batch).astype(int)
             network_output = []
             for i in range(slices):
                 beg_index = m_batch * i
@@ -407,7 +420,7 @@ class BatchWorker_GPU(object):
 
                 m_obs = torch.from_numpy(policy_obs_lst[beg_index:end_index]).to(device).float() / 255.0
                 if self.config.amp_type == 'torch_amp':
-                    with autocast():
+                    with autocast(device_type=self.config.device):
                         m_output = self.model.initial_inference(m_obs)
                 else:
                     m_output = self.model.initial_inference(m_obs)
@@ -494,18 +507,24 @@ class BatchWorker_GPU(object):
 
             targets_batch = [batch_value_prefixs, batch_values, batch_policies]
             # a batch contains the inputs and the targets; inputs is prepared in CPU workers
+            logger_gpu.info('sending to batch_storage...')
             self.batch_storage.push([inputs_batch, targets_batch])
 
     def run(self):
         start = False
+        logger_gpu.addHandler(logging.FileHandler('gpu_worker.log'))
         while True:
             # waiting for start signal
             if not start:
                 start = ray.get(self.storage.get_start_signal.remote())
-                time.sleep(0.1)
+                logger_gpu.info('waiting for start signal...')
+                time.sleep(1)
                 continue
+            logger_gpu.info('Start making batch...')
 
+            logger_gpu.info('getting mcts data...')
             trained_steps = ray.get(self.storage.get_counter.remote())
+            logger_gpu.info('got mcts data...')
             if trained_steps >= self.config.training_steps + self.config.last_steps:
                 time.sleep(30)
                 break

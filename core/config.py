@@ -251,7 +251,7 @@ class BaseConfig(object):
         self.value_loss_coeff = value_loss_coeff
         self.policy_loss_coeff = policy_loss_coeff
         self.consistency_coeff = consistency_coeff
-        self.device = 'cuda'
+        self.device = 'mps'
         self.exp_path = None  # experiment path
         self.debug = False
         self.model_path = None

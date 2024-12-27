@@ -7,13 +7,13 @@ import numpy as np
 import core.ctree.cytree as cytree
 
 from tqdm.auto import tqdm
-from torch.cuda.amp import autocast as autocast
+from torch.amp import autocast as autocast
 from core.mcts import MCTS
 from core.game import GameHistory
 from core.utils import select_action, prepare_observation_lst
 
 
-@ray.remote(num_gpus=0.25)
+@ray.remote(num_gpus=0.0)
 def _test(config, shared_storage):
     test_model = config.get_uniform_network()
     best_test_score = float('-inf')
@@ -107,7 +107,7 @@ def test(config, model, counter, test_episodes, device, render, save_video=False
                 stack_obs = [game_history.step_obs() for game_history in game_histories]
                 stack_obs = torch.from_numpy(np.array(stack_obs)).to(device)
 
-            with autocast():
+            with autocast(device_type=device):
                 network_output = model.initial_inference(stack_obs.float())
             hidden_state_roots = network_output.hidden_state
             reward_hidden_roots = network_output.reward_hidden

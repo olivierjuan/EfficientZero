@@ -6,13 +6,16 @@ import numpy as np
 import core.ctree.cytree as cytree
 
 from torch.nn import L1Loss
-from torch.cuda.amp import autocast as autocast
+from torch.amp import autocast as autocast
 from core.mcts import MCTS
 from core.game import GameHistory
 from core.utils import select_action, prepare_observation_lst
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-@ray.remote(num_gpus=0.125)
+@ray.remote(num_gpus=0.0)
 class DataWorker(object):
     def __init__(self, rank, replay_buffer, storage, config):
         """Data Worker for collecting data through self-play
@@ -103,6 +106,8 @@ class DataWorker(object):
 
     def run(self):
         # number of parallel mcts
+        logger.addHandler(logging.FileHandler('log_dataworker.txt'))
+        logger.info(f'rank: {self.rank}')
         env_nums = self.config.p_mcts_num
         model = self.config.get_uniform_network()
         model.to(self.device)
@@ -124,6 +129,7 @@ class DataWorker(object):
             while True:
                 trained_steps = ray.get(self.storage.get_counter.remote())
                 # training finished
+                logger.info(f'trained_steps: {trained_steps}\n')
                 if trained_steps >= self.config.training_steps + self.config.last_steps:
                     time.sleep(30)
                     break
@@ -162,6 +168,7 @@ class DataWorker(object):
                 other_dist = {}
 
                 # play games until max moves
+                logger.info(f'started games')
                 while not dones.all() and (step_counter <= self.config.max_moves):
                     if not start_training:
                         start_training = ray.get(self.storage.get_start_signal.remote())
@@ -174,6 +181,7 @@ class DataWorker(object):
                         return
                     if start_training and (total_transitions / max_transitions) > (trained_steps / self.config.training_steps):
                         # self-play is faster than training speed or finished
+                        logger.info(f'self-play is faster than training speed or finished. waiting for training : {total_transitions}/{max_transitions}->{trained_steps}/{self.config.training_steps}')
                         time.sleep(1)
                         continue
 
@@ -185,6 +193,7 @@ class DataWorker(object):
                     # update the models in self-play every checkpoint_interval
                     new_model_index = trained_steps // self.config.checkpoint_interval
                     if new_model_index > self.last_model_index:
+                        logger.info(f'new_model_index: {new_model_index}')
                         self.last_model_index = new_model_index
                         # update model
                         weights = ray.get(self.storage.get_weights.remote())
@@ -235,7 +244,7 @@ class DataWorker(object):
                             # reset the finished env and new a env
                             envs[i].close()
                             init_obs = envs[i].reset()
-                            game_histories[i] = GameHistory(env.env.action_space, max_length=self.config.history_length,
+                            game_histories[i] = GameHistory(envs[i].env.action_space, max_length=self.config.history_length,
                                                             config=self.config)
                             last_game_histories[i] = None
                             last_game_priorities[i] = None
@@ -269,7 +278,7 @@ class DataWorker(object):
                         stack_obs = torch.from_numpy(np.array(stack_obs)).to(self.device)
 
                     if self.config.amp_type == 'torch_amp':
-                        with autocast():
+                        with autocast(device_type=self.device):
                             network_output = model.initial_inference(stack_obs.float())
                     else:
                         network_output = model.initial_inference(stack_obs.float())
@@ -282,6 +291,7 @@ class DataWorker(object):
                     noises = [np.random.dirichlet([self.config.root_dirichlet_alpha] * self.config.action_space_size).astype(np.float32).tolist() for _ in range(env_nums)]
                     roots.prepare(self.config.root_exploration_fraction, noises, value_prefix_pool, policy_logits_pool)
                     # do MCTS for a policy
+                    logger.info(f'running MCTS {step_counter}/{self.config.max_moves}')
                     MCTS(self.config).search(roots, model, hidden_state_roots, reward_hidden_roots)
 
                     roots_distributions = roots.get_distributions()
@@ -342,6 +352,7 @@ class DataWorker(object):
                                                             config=self.config)
                             game_histories[i].init(stack_obs_windows[i])
 
+                logger.info(f'finished games')
                 for i in range(env_nums):
                     env = envs[i]
                     env.close()

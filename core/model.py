@@ -94,7 +94,7 @@ class BaseNet(nn.Module):
                              torch.zeros(1, num, self.lstm_hidden_size).detach().cpu().numpy())
         else:
             # zero initialization for reward (value prefix) hidden states
-            reward_hidden = (torch.zeros(1, num, self.lstm_hidden_size).to('cuda'), torch.zeros(1, num, self.lstm_hidden_size).to('cuda'))
+            reward_hidden = (torch.zeros(1, num, self.lstm_hidden_size).to('mps'), torch.zeros(1, num, self.lstm_hidden_size).to('mps'))
 
         return NetworkOutput(value, [0. for _ in range(num)], actor_logit, state, reward_hidden)
 

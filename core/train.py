@@ -8,15 +8,17 @@ import torch.optim as optim
 import torch.nn.functional as F
 
 from torch.nn import L1Loss
-from torch.cuda.amp import autocast as autocast
-from torch.cuda.amp import GradScaler as GradScaler
+from torch.amp import autocast as autocast
+from torch.amp import GradScaler as GradScaler
 from core.log import _log
 from core.test import _test
 from core.replay_buffer import ReplayBuffer
 from core.storage import SharedStorage, QueueStorage
 from core.selfplay_worker import DataWorker
 from core.reanalyze_worker import BatchWorker_GPU, BatchWorker_CPU
+import logging
 
+logger = logging.getLogger(__name__)
 
 def consist_loss_func(f1, f2):
     """Consistency loss function: similarity loss
@@ -56,6 +58,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     vis_result: bool
         True -> log some visualization data in tensorboard (some distributions, values, etc)
     """
+    device = config.device
     inputs_batch, targets_batch = batch
     obs_batch_ori, action_batch, mask_batch, indices, weights_lst, make_time = inputs_batch
     target_value_prefix, target_value, target_policy = targets_batch
@@ -65,7 +68,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     # obs_batch is the observation for hat s_t (predicted hidden states from dynamics function)
     # obs_target_batch is the observations for s_t (hidden states from representation function)
     # to save GPU memory usage, obs_batch_ori contains (stack + unroll steps) frames
-    obs_batch_ori = torch.from_numpy(obs_batch_ori).to(config.device).float() / 255.0
+    obs_batch_ori = torch.from_numpy(obs_batch_ori).to(device).float() / 255.0
     obs_batch = obs_batch_ori[:, 0: config.stacked_observations * config.image_channel, :, :]
     obs_target_batch = obs_batch_ori[:, config.image_channel:, :, :]
 
@@ -75,12 +78,12 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
         obs_target_batch = config.transform(obs_target_batch)
 
     # use GPU tensor
-    action_batch = torch.from_numpy(action_batch).to(config.device).unsqueeze(-1).long()
-    mask_batch = torch.from_numpy(mask_batch).to(config.device).float()
-    target_value_prefix = torch.from_numpy(target_value_prefix).to(config.device).float()
-    target_value = torch.from_numpy(target_value).to(config.device).float()
-    target_policy = torch.from_numpy(target_policy).to(config.device).float()
-    weights = torch.from_numpy(weights_lst).to(config.device).float()
+    action_batch = torch.from_numpy(action_batch).to(device).unsqueeze(-1).long()
+    mask_batch = torch.from_numpy(mask_batch).float().to(device)
+    target_value_prefix = torch.from_numpy(target_value_prefix).float().to(device)
+    target_value = torch.from_numpy(target_value).float().to(device)
+    target_policy = torch.from_numpy(target_policy).float().to(device)
+    weights = torch.from_numpy(weights_lst).float().to(device)
 
     batch_size = obs_batch.size(0)
     assert batch_size == config.batch_size == target_value_prefix.size(0)
@@ -111,7 +114,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     target_value_phi = config.value_phi(transformed_target_value)
 
     if config.amp_type == 'torch_amp':
-        with autocast():
+        with autocast(device_type=device):
             value, _, policy_logits, hidden_state, reward_hidden = model.initial_inference(obs_batch)
     else:
         value, _, policy_logits, hidden_state, reward_hidden = model.initial_inference(obs_batch)
@@ -132,15 +135,15 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     # loss of the first step
     value_loss = config.scalar_value_loss(value, target_value_phi[:, 0])
     policy_loss = -(torch.log_softmax(policy_logits, dim=1) * target_policy[:, 0]).sum(1)
-    value_prefix_loss = torch.zeros(batch_size, device=config.device)
-    consistency_loss = torch.zeros(batch_size, device=config.device)
+    value_prefix_loss = torch.zeros(batch_size, device=device)
+    consistency_loss = torch.zeros(batch_size, device=device)
 
     target_value_prefix_cpu = target_value_prefix.detach().cpu()
     gradient_scale = 1 / config.num_unroll_steps
     # loss of the unrolled steps
     if config.amp_type == 'torch_amp':
         # use torch amp
-        with autocast():
+        with autocast(device_type=device):
             for step_i in range(config.num_unroll_steps):
                 # unroll with the dynamics function
                 value, value_prefix, policy_logits, hidden_state, reward_hidden = model.recurrent_inference(hidden_state, reward_hidden, action_batch[:, step_i])
@@ -168,8 +171,8 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
 
                 # reset hidden states
                 if (step_i + 1) % config.lstm_horizon_len == 0:
-                    reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(config.device),
-                                     torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(config.device))
+                    reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(device),
+                                     torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(device))
 
                 if vis_result:
                     scaled_value_prefixs = config.inverse_reward_transform(value_prefix.detach())
@@ -223,8 +226,8 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
 
             # reset hidden states
             if (step_i + 1) % config.lstm_horizon_len == 0:
-                reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(config.device),
-                                 torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(config.device))
+                reward_hidden = (torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(device),
+                                 torch.zeros(1, config.batch_size, config.lstm_hidden_size).to(device))
 
             if vis_result:
                 scaled_value_prefixs = config.inverse_reward_transform(value_prefix.detach())
@@ -259,7 +262,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     # backward
     parameters = model.parameters()
     if config.amp_type == 'torch_amp':
-        with autocast():
+        with autocast(device_type=device):
             total_loss = weighted_loss
             total_loss.register_hook(lambda grad: grad * gradient_scale)
     else:
@@ -348,7 +351,7 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
     optimizer = optim.SGD(model.parameters(), lr=config.lr_init, momentum=config.momentum,
                           weight_decay=config.weight_decay)
 
-    scaler = GradScaler()
+    scaler = GradScaler(config.device)
 
     model.train()
     target_model.eval()
@@ -377,10 +380,13 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
             replay_buffer.remove_to_fit.remote()
 
         # obtain a batch
+
         batch = batch_storage.pop()
         if batch is None:
-            time.sleep(0.3)
+            logger.info('waiting  batch data')
+            time.sleep(1)
             continue
+        logger.info('got batch data')
         shared_storage.incr_counter.remote()
         lr = adjust_lr(config, optimizer, step_count)
 
@@ -399,10 +405,13 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
             vis_result = False
 
         if config.amp_type == 'torch_amp':
+            logger.info('learning')
             log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
             scaler = log_data[3]
         else:
+            logger.info('learning')
             log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
+        logger.info('model is updated')
 
         if step_count % config.log_interval == 0:
             _log(config, step_count, log_data[0:3], model, replay_buffer, lr, shared_storage, summary_writer, vis_result)
@@ -462,7 +471,7 @@ def train(config, summary_writer, model_path=None):
     data_workers = [DataWorker.remote(rank, replay_buffer, storage, config) for rank in range(0, config.num_actors)]
     workers += [worker.run.remote() for worker in data_workers]
     # test workers
-    workers += [_test.remote(config, storage)]
+    #workers += [_test.remote(config, storage)]
 
     # training loop
     final_weights = _train(model, target_model, replay_buffer, storage, batch_storage, config, summary_writer)

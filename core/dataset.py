@@ -34,7 +34,7 @@ class Transforms(object):
 
     def apply_transforms(self, transforms, image):
         for transform in transforms:
-            image = transform(image)
+            image = transform(image.to('cpu')).to(image.device)
         return image
 
     @torch.no_grad()

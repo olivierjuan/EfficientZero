@@ -56,13 +56,14 @@ if __name__ == '__main__':
 
     # Process arguments
     args = parser.parse_args()
-    args.device = 'cuda' if (not args.no_cuda) and torch.cuda.is_available() else 'cpu'
+    args.device = 'mps' if (not args.no_cuda) and torch.mps.is_available() else 'cpu'
     assert args.revisit_policy_search_rate is None or 0 <= args.revisit_policy_search_rate <= 1, \
         ' Revisit policy search rate should be in [0,1]'
 
     if args.opr == 'train':
-        ray.init(num_gpus=args.num_gpus, num_cpus=args.num_cpus,
-                 object_store_memory=args.object_store_memory)
+        ray.init(#num_gpus=args.num_gpus, num_cpus=args.num_cpus,
+                 #object_store_memory=args.object_store_memory,
+                 address='local', include_dashboard=True)
     else:
         ray.init()
 
